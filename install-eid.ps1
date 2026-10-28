@@ -60,6 +60,36 @@ function Get-RegisteredExe($productCode) {
         $wi.ComponentPath($productCode, "{D34D7FD1-31B2-5F8D-9C4F-64A73D251BD8}")
     } catch { $null }
 }
+# MOHRE's MSI cannot be uninstalled normally: its service/delete steps run during uninstall in a folder
+# that no longer exists (error 1721). Disable those 3 steps in Windows' cached copy of the installed MSI,
+# then uninstall. The services are handled by this script itself.
+function Invoke-CleanUninstall($productCode) {
+    $local = Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products" -ErrorAction SilentlyContinue |
+             ForEach-Object { Get-ItemProperty (Join-Path $_.PSPath "InstallProperties") -ErrorAction SilentlyContinue } |
+             Where-Object { $_.DisplayName -eq $Product } | Select-Object -First 1 -ExpandProperty LocalPackage
+    if ($local -and (Test-Path $local)) {
+        $bk = Join-Path $env:ProgramData "EID_MOHRE"; New-Item -ItemType Directory $bk -Force | Out-Null
+        Copy-Item $local (Join-Path $bk ("cached_" + (Split-Path $local -Leaf))) -Force
+        (Get-Item $local).IsReadOnly = $false
+        $wi = New-Object -ComObject WindowsInstaller.Installer
+        $db = $wi.GetType().InvokeMember("OpenDatabase", "InvokeMethod", $null, $wi, @($local, 1))
+        foreach ($a in "ExecInstallService", "ExecRemoveService", "ExecDeleteFiles") {
+            $v = $db.GetType().InvokeMember("OpenView", "InvokeMethod", $null, $db, @("UPDATE ``InstallExecuteSequence`` SET ``Condition`` = '0' WHERE ``Action`` = '$a'"))
+            [void]$v.GetType().InvokeMember("Execute", "InvokeMethod", $null, $v, $null)
+            [void]$v.GetType().InvokeMember("Close", "InvokeMethod", $null, $v, $null)
+            [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($v)
+        }
+        [void]$db.GetType().InvokeMember("Commit", "InvokeMethod", $null, $db, $null)
+        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($db)
+        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($wi)
+        [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+        Write-Output "Patched cached installer ($local) so it can uninstall"
+    } else { Write-Warning "Cached installer not found - trying a normal uninstall" }
+    $ulog = "$env:WINDIR\Temp\EID_MOHRE-uninstall.log"
+    $p = Start-Process msiexec.exe -ArgumentList "/x $productCode /qn /norestart /L*v `"$ulog`"" -Wait -PassThru
+    if ($p.ExitCode -notin 0, 3010, 1605) { throw "Uninstall of the old version failed (exit $($p.ExitCode)). See $ulog" }
+    Write-Output "Old version uninstalled"
+}
 function Test-TargetInstalled { (Test-Path (Join-Path $TargetDir "EIDAToolkitService.exe")) -and (Get-TargetService) }
 
 try {
@@ -152,22 +182,16 @@ try {
         }
         Get-Process EIDAToolkitService -ErrorAction SilentlyContinue | Where-Object { Test-InTarget $_.Path } | Stop-Process -Force
         Start-Sleep -Seconds 2
-        # 5c. NO msiexec /x: MOHRE's MSI runs its "install service" step during uninstall too, after the
-        #     files are gone, so uninstall always fails (error 1721). We wipe the folder and reinstall over it.
+        # 5c. Uninstall the old MSI (with MOHRE's broken uninstall steps switched off)
+        if ($inst) { Invoke-CleanUninstall $inst.PSChildName; Start-Sleep -Seconds 3 }
         # 5d. Delete the target folder only
         if (Test-Path $TargetDir) { Write-Output "Deleting $TargetDir"; Remove-Item $TargetDir -Recurse -Force -ErrorAction SilentlyContinue }
     } else { Write-Output "No existing 'Emirates ID Card Toolkit Service' - fresh install" }
 
-    # 5e. Fresh install, or full reinstall of every file if Windows already has the product registered
+    # 5e. Fresh install into the target folder
     $log = "$env:WINDIR\Temp\EID_MOHRE-msi.log"
-    if (Get-Installed) {
-        Write-Output "Reinstalling all files of $($msi.Name) into $TargetDir"
-        $msiArgs = "/i `"$($msi.FullName)`" INSTALLDIR=`"$TargetDir\`" REINSTALL=ALL REINSTALLMODE=vamus /qn /norestart /L*v `"$log`""
-    } else {
-        Write-Output "Installing $($msi.Name) to $TargetDir"
-        $msiArgs = "/i `"$($msi.FullName)`" INSTALLDIR=`"$TargetDir\`" /qn /norestart /L*v `"$log`""
-    }
-    $p = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru
+    Write-Output "Installing $($msi.Name) to $TargetDir"
+    $p = Start-Process msiexec.exe -ArgumentList "/i `"$($msi.FullName)`" INSTALLDIR=`"$TargetDir\`" /qn /norestart /L*v `"$log`"" -Wait -PassThru
     if ($p.ExitCode -notin 0, 3010, 1641) { throw "MSI install failed (exit $($p.ExitCode)). See $log" }
     Start-Sleep -Seconds 5
     if (-not (Test-Path (Join-Path $TargetDir "EIDAToolkitService.exe"))) { throw "MSI finished but EIDAToolkitService.exe is not in $TargetDir. See $log" }

@@ -67,14 +67,15 @@ function Invoke-CleanUninstall($productCode) {
     $local = Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products" -ErrorAction SilentlyContinue |
              ForEach-Object { Get-ItemProperty (Join-Path $_.PSPath "InstallProperties") -ErrorAction SilentlyContinue } |
              Where-Object { $_.DisplayName -eq $Product } | Select-Object -First 1 -ExpandProperty LocalPackage
+    $local = [string]$local   # plain string - COM rejects PowerShell-wrapped objects
     if ($local -and (Test-Path $local)) {
         $bk = Join-Path $env:ProgramData "EID_MOHRE"; New-Item -ItemType Directory $bk -Force | Out-Null
         Copy-Item $local (Join-Path $bk ("cached_" + (Split-Path $local -Leaf))) -Force
         (Get-Item $local).IsReadOnly = $false
         $wi = New-Object -ComObject WindowsInstaller.Installer
-        $db = $wi.GetType().InvokeMember("OpenDatabase", "InvokeMethod", $null, $wi, @($local, 1))
+        $db = $wi.GetType().InvokeMember("OpenDatabase", "InvokeMethod", $null, $wi, @([string]$local, [int]1))
         foreach ($a in "ExecInstallService", "ExecRemoveService", "ExecDeleteFiles") {
-            $v = $db.GetType().InvokeMember("OpenView", "InvokeMethod", $null, $db, @("UPDATE ``InstallExecuteSequence`` SET ``Condition`` = '0' WHERE ``Action`` = '$a'"))
+            $v = $db.GetType().InvokeMember("OpenView", "InvokeMethod", $null, $db, @([string]"UPDATE ``InstallExecuteSequence`` SET ``Condition`` = '0' WHERE ``Action`` = '$a'"))
             [void]$v.GetType().InvokeMember("Execute", "InvokeMethod", $null, $v, $null)
             [void]$v.GetType().InvokeMember("Close", "InvokeMethod", $null, $v, $null)
             [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($v)

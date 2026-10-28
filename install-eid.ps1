@@ -48,7 +48,7 @@ function Get-ToolkitServices {
 function Test-InTarget([string]$path) { $path -and $path.TrimEnd('\').StartsWith($TargetDir, [StringComparison]::OrdinalIgnoreCase) }
 # Only the "Emirates ID Card Toolkit Service": by display name, or running from the target folder
 function Get-EmiratesServices {
-    Get-ToolkitServices | Where-Object { $_.DisplayName -eq $ServiceDisp -or (Test-InTarget (Get-SvcExe $_)) }
+    Get-ToolkitServices | Where-Object { $_.Name -eq "ICAToolkitService" -or $_.DisplayName -eq $ServiceDisp -or (Test-InTarget (Get-SvcExe $_)) }
 }
 function Get-TargetService {
     Get-ToolkitServices | Where-Object { Test-InTarget (Get-SvcExe $_) } | Select-Object -First 1
@@ -120,7 +120,7 @@ try {
     Write-Output "Target folder: $TargetDir"
 
     # Remember the OTHER toolkit services exactly as they are, so they can be restored if anything removes them
-    $protect = @(Get-ToolkitServices | Where-Object { -not (Test-InTarget (Get-SvcExe $_)) -and $_.DisplayName -ne $ServiceDisp } |
+    $protect = @(Get-ToolkitServices | Where-Object { -not (Test-InTarget (Get-SvcExe $_)) -and $_.DisplayName -ne $ServiceDisp -and $_.Name -ne "ICAToolkitService" } |
                  Select-Object Name, DisplayName, PathName, StartMode, State)
     foreach ($o in $protect) { Write-Output "Leaving untouched: '$($o.DisplayName)' ($($o.Name)) -> $($o.PathName)" }
 
@@ -152,21 +152,22 @@ try {
         }
         Get-Process EIDAToolkitService -ErrorAction SilentlyContinue | Where-Object { Test-InTarget $_.Path } | Stop-Process -Force
         Start-Sleep -Seconds 2
-        # 5c. Uninstall the MSI (it belongs to the target folder - checked above)
-        if ($inst) {
-            Write-Output "Uninstalling previous MSI ($($inst.PSChildName))"
-            $p = Start-Process msiexec.exe -ArgumentList "/x $($inst.PSChildName) /qn /norestart" -Wait -PassThru
-            if ($p.ExitCode -notin 0, 3010, 1605) { Write-Warning "MSI uninstall returned $($p.ExitCode) - continuing" }
-            Start-Sleep -Seconds 3
-        }
+        # 5c. NO msiexec /x: MOHRE's MSI runs its "install service" step during uninstall too, after the
+        #     files are gone, so uninstall always fails (error 1721). We wipe the folder and reinstall over it.
         # 5d. Delete the target folder only
         if (Test-Path $TargetDir) { Write-Output "Deleting $TargetDir"; Remove-Item $TargetDir -Recurse -Force -ErrorAction SilentlyContinue }
     } else { Write-Output "No existing 'Emirates ID Card Toolkit Service' - fresh install" }
 
-    # 5e. Fresh install into the target folder
-    Write-Output "Installing $($msi.Name) to $TargetDir"
+    # 5e. Fresh install, or full reinstall of every file if Windows already has the product registered
     $log = "$env:WINDIR\Temp\EID_MOHRE-msi.log"
-    $p = Start-Process msiexec.exe -ArgumentList "/i `"$($msi.FullName)`" INSTALLDIR=`"$TargetDir\`" /qn /norestart /L*v `"$log`"" -Wait -PassThru
+    if (Get-Installed) {
+        Write-Output "Reinstalling all files of $($msi.Name) into $TargetDir"
+        $msiArgs = "/i `"$($msi.FullName)`" INSTALLDIR=`"$TargetDir\`" REINSTALL=ALL REINSTALLMODE=vamus /qn /norestart /L*v `"$log`""
+    } else {
+        Write-Output "Installing $($msi.Name) to $TargetDir"
+        $msiArgs = "/i `"$($msi.FullName)`" INSTALLDIR=`"$TargetDir\`" /qn /norestart /L*v `"$log`""
+    }
+    $p = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru
     if ($p.ExitCode -notin 0, 3010, 1641) { throw "MSI install failed (exit $($p.ExitCode)). See $log" }
     Start-Sleep -Seconds 5
     if (-not (Test-Path (Join-Path $TargetDir "EIDAToolkitService.exe"))) { throw "MSI finished but EIDAToolkitService.exe is not in $TargetDir. See $log" }
@@ -201,8 +202,18 @@ try {
     if (-not $svc) { throw "Toolkit service was not created. Check $TargetDir" }
     & sc.exe config "$($svc.Name)" DisplayName= "$ServiceDisp" start= auto | Out-Null
     & sc.exe description "$($svc.Name)" "$ServiceDisp" | Out-Null
-    Start-Service -Name $svc.Name
-    Write-Output "Service '$ServiceDisp' (name: $($svc.Name)) running from $TargetDir"
+    $other = Get-Service ICAToolkit -ErrorAction SilentlyContinue
+    if ($other -and $other.Status -eq "Running") {
+        Write-Warning "ICAToolkit (old toolkit) is also running. Both use the same agent, so only ONE can work at a time."
+    }
+    try {
+        Start-Service -Name $svc.Name
+        Start-Sleep -Seconds 3
+        $state = (Get-Service -Name $svc.Name).Status
+        Write-Output "Service '$ServiceDisp' (name: $($svc.Name)) is $state - $TargetDir"
+    } catch {
+        Write-Warning "Installed, but '$ServiceDisp' could not start: $($_.Exception.Message)"
+    }
 
     # 8. Remember what is installed
     New-Item $RegKey -Force | Out-Null

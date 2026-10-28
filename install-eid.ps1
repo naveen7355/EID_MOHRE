@@ -33,8 +33,26 @@ function Get-Installed {
     Get-ItemProperty $paths -ErrorAction SilentlyContinue | Where-Object DisplayName -eq $Product | Select-Object -First 1
 }
 function Get-InstallDir {
-    foreach ($base in ${env:ProgramFiles(x86)}, $env:ProgramFiles) {
+    # 1. Folder of the installed service (most reliable - works wherever it was installed)
+    $svc = Get-CimInstance Win32_Service | Where-Object { $_.PathName -like "*EIDAToolkitService.exe*" } | Select-Object -First 1
+    if ($svc) {
+        $exe = ($svc.PathName -replace '^"([^"]+)".*$', '$1') -replace '\s+-.*$', ''
+        if (Test-Path $exe) { return (Split-Path $exe -Parent) }
+    }
+    # 2. InstallLocation from Programs and Features
+    $inst = Get-Installed
+    if ($inst -and $inst.InstallLocation -and (Test-Path (Join-Path $inst.InstallLocation "EIDAToolkitService.exe"))) {
+        return $inst.InstallLocation.TrimEnd('\')
+    }
+    # 3. Default folders
+    foreach ($base in ${env:ProgramFiles(x86)}, $env:ProgramFiles, $env:SystemDrive) {
         if ($base -and (Test-Path (Join-Path $base "$Product\EIDAToolkitService.exe"))) { return (Join-Path $base $Product) }
+    }
+    # 4. Last resort: search Program Files for the service exe
+    foreach ($base in ${env:ProgramFiles(x86)}, $env:ProgramFiles) {
+        if (-not $base) { continue }
+        $hit = Get-ChildItem $base -Filter EIDAToolkitService.exe -Recurse -Depth 2 -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($hit) { return $hit.DirectoryName }
     }
     return $null
 }
@@ -116,7 +134,19 @@ try {
 
     # 6. Copy config files + restart the service
     $dir = Get-InstallDir
-    if (-not $dir) { throw "Install folder not found after installation." }
+    if (-not $dir -and $msi) {
+        # Registered as installed, but the program files are missing -> reinstall cleanly
+        Write-Output "Toolkit files not found - reinstalling the MSI"
+        $inst = Get-Installed
+        if ($inst) { Start-Process msiexec.exe -ArgumentList "/x $($inst.PSChildName) /qn /norestart" -Wait | Out-Null }
+        $log = "$env:WINDIR\Temp\EID_MOHRE-msi.log"
+        $p = Start-Process msiexec.exe -ArgumentList "/i `"$($msi.FullName)`" /qn /norestart /L*v `"$log`"" -Wait -PassThru
+        if ($p.ExitCode -notin 0, 3010, 1641) { throw "MSI reinstall failed (exit $($p.ExitCode)). See $log" }
+        Start-Sleep -Seconds 5
+        $dir = Get-InstallDir
+    }
+    if (-not $dir) { throw "Toolkit install folder not found. Run: Get-CimInstance Win32_Service | ? PathName -like '*EIDA*' | select Name,PathName" }
+    Write-Output "Install folder: $dir"
     $cfg = Get-ChildItem $pkg -File | Where-Object { $_.Extension -ne ".msi" }
     $svc = Get-ToolkitService
     if ($svc -and $svc.State -eq "Running") { Stop-Service -Name $svc.Name -Force; Start-Sleep -Seconds 2 }

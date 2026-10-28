@@ -53,37 +53,59 @@ function Get-EmiratesServices {
 function Get-TargetService {
     Get-ToolkitServices | Where-Object { Test-InTarget (Get-SvcExe $_) } | Select-Object -First 1
 }
+# Native Windows Installer calls (msi.dll) - used instead of COM, which fails with "Type mismatch" in PowerShell
+if (-not ("MsiNative" -as [type])) {
+    Add-Type -TypeDefinition @"
+using System; using System.Text; using System.Runtime.InteropServices;
+public static class MsiNative {
+    [DllImport("msi.dll", CharSet = CharSet.Unicode)] static extern uint MsiOpenDatabase(string path, IntPtr persist, out IntPtr db);
+    [DllImport("msi.dll", CharSet = CharSet.Unicode)] static extern uint MsiDatabaseOpenView(IntPtr db, string query, out IntPtr view);
+    [DllImport("msi.dll")] static extern uint MsiViewExecute(IntPtr view, IntPtr record);
+    [DllImport("msi.dll")] static extern uint MsiViewClose(IntPtr view);
+    [DllImport("msi.dll")] static extern uint MsiDatabaseCommit(IntPtr db);
+    [DllImport("msi.dll")] static extern uint MsiCloseHandle(IntPtr h);
+    [DllImport("msi.dll", CharSet = CharSet.Unicode)] static extern int MsiGetComponentPath(string product, string component, StringBuilder path, ref uint len);
+    public static void RunQueries(string path, string[] queries) {
+        IntPtr db; uint r = MsiOpenDatabase(path, (IntPtr)1, out db);   // 1 = transact mode
+        if (r != 0) throw new Exception("MsiOpenDatabase failed: " + r);
+        try {
+            foreach (string q in queries) {
+                IntPtr v; r = MsiDatabaseOpenView(db, q, out v);
+                if (r != 0) throw new Exception("MsiDatabaseOpenView failed: " + r);
+                try { r = MsiViewExecute(v, IntPtr.Zero); if (r != 0) throw new Exception("MsiViewExecute failed: " + r); }
+                finally { MsiViewClose(v); MsiCloseHandle(v); }
+            }
+            r = MsiDatabaseCommit(db); if (r != 0) throw new Exception("MsiDatabaseCommit failed: " + r);
+        } finally { MsiCloseHandle(db); }
+    }
+    public static string ComponentPath(string product, string component) {
+        uint len = 1024; StringBuilder sb = new StringBuilder((int)len);
+        MsiGetComponentPath(product, component, sb, ref len);
+        return sb.ToString();
+    }
+}
+"@
+}
 # Where the registered MSI really lives (path of its EIDAToolkitService.exe component)
-function Get-RegisteredExe($productCode) {
-    try {
-        $wi = New-Object -ComObject WindowsInstaller.Installer
-        $wi.ComponentPath($productCode, "{D34D7FD1-31B2-5F8D-9C4F-64A73D251BD8}")
-    } catch { $null }
+function Get-RegisteredExe([string]$productCode) {
+    try { $p = [MsiNative]::ComponentPath($productCode, "{D34D7FD1-31B2-5F8D-9C4F-64A73D251BD8}"); if ($p) { $p } else { $null } } catch { $null }
 }
 # MOHRE's MSI cannot be uninstalled normally: its service/delete steps run during uninstall in a folder
 # that no longer exists (error 1721). Disable those 3 steps in Windows' cached copy of the installed MSI,
 # then uninstall. The services are handled by this script itself.
-function Invoke-CleanUninstall($productCode) {
+function Invoke-CleanUninstall([string]$productCode) {
     $local = Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products" -ErrorAction SilentlyContinue |
              ForEach-Object { Get-ItemProperty (Join-Path $_.PSPath "InstallProperties") -ErrorAction SilentlyContinue } |
              Where-Object { $_.DisplayName -eq $Product } | Select-Object -First 1 -ExpandProperty LocalPackage
-    $local = [string]$local   # plain string - COM rejects PowerShell-wrapped objects
+    $local = [string]$local
     if ($local -and (Test-Path $local)) {
         $bk = Join-Path $env:ProgramData "EID_MOHRE"; New-Item -ItemType Directory $bk -Force | Out-Null
         Copy-Item $local (Join-Path $bk ("cached_" + (Split-Path $local -Leaf))) -Force
         (Get-Item $local).IsReadOnly = $false
-        $wi = New-Object -ComObject WindowsInstaller.Installer
-        $db = $wi.GetType().InvokeMember("OpenDatabase", "InvokeMethod", $null, $wi, @([string]$local, [int]1))
-        foreach ($a in "ExecInstallService", "ExecRemoveService", "ExecDeleteFiles") {
-            $v = $db.GetType().InvokeMember("OpenView", "InvokeMethod", $null, $db, @([string]"UPDATE ``InstallExecuteSequence`` SET ``Condition`` = '0' WHERE ``Action`` = '$a'"))
-            [void]$v.GetType().InvokeMember("Execute", "InvokeMethod", $null, $v, $null)
-            [void]$v.GetType().InvokeMember("Close", "InvokeMethod", $null, $v, $null)
-            [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($v)
+        $queries = foreach ($a in "ExecInstallService", "ExecRemoveService", "ExecDeleteFiles") {
+            "UPDATE ``InstallExecuteSequence`` SET ``Condition`` = '0' WHERE ``Action`` = '$a'"
         }
-        [void]$db.GetType().InvokeMember("Commit", "InvokeMethod", $null, $db, $null)
-        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($db)
-        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($wi)
-        [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+        [MsiNative]::RunQueries($local, [string[]]$queries)
         Write-Output "Patched cached installer ($local) so it can uninstall"
     } else { Write-Warning "Cached installer not found - trying a normal uninstall" }
     $ulog = "$env:WINDIR\Temp\EID_MOHRE-uninstall.log"

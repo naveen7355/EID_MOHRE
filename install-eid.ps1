@@ -1,4 +1,4 @@
-<# Folder of the installed service
+<#
   Install / update the Emirates ID Card Toolkit Service from GitHub (encrypted package).
 
   Manual install (admin PowerShell) - asks for the package password:
@@ -7,8 +7,11 @@
   What it does
   - Checks the latest GitHub Release. If this PC already has it -> stops (no password asked).
   - Downloads EID_MOHRE.bin, asks for the password, verifies and decrypts it.
-  - Installs the MSI if the toolkit is missing (or if the MSI in the release changed).
-  - Copies the config_* files into the install folder and restarts the toolkit service.
+  - Clean reinstall on every new release, ONLY for "Emirates ID Card Toolkit Service":
+    removes that service + C:\Program Files (x86)\Emirates ID Card Toolkit Service (configs backed up
+    to C:\ProgramData\EID_MOHRE), then installs the MSI there again.
+    Other toolkit services (e.g. ICAToolkit) are never touched.
+  - Copies the new config_* files in and starts the service as 'Emirates ID Card Toolkit Service'.
   - Log: C:\Windows\Temp\EID_MOHRE-deploy.log
 #>
 param(
@@ -27,38 +30,37 @@ Add-Type -AssemblyName System.Security
 Start-Transcript -Path "$env:WINDIR\Temp\EID_MOHRE-deploy.log" -Append | Out-Null
 $Work = $null
 
+$TargetDir   = Join-Path $(if (${env:ProgramFiles(x86)}) { ${env:ProgramFiles(x86)} } else { $env:ProgramFiles }) $Product
+$ServiceDisp = "Emirates ID Card Toolkit Service"   # display name shown in services.msc
+
 function Get-Installed {
     $paths = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
              "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
     Get-ItemProperty $paths -ErrorAction SilentlyContinue | Where-Object DisplayName -eq $Product | Select-Object -First 1
 }
-function Get-InstallDir {
-    # 1. Folder of the installed service (most reliable - works wherever it was installed)
-    $svc = Get-CimInstance Win32_Service | Where-Object { $_.PathName -like "*EIDAToolkitService.exe*" } | Select-Object -First 1
-    if ($svc) {
-        $exe = ($svc.PathName -replace '^"([^"]+)".*$', '$1') -replace '\s+-.*$', ''
-        if (Test-Path $exe) { return (Split-Path $exe -Parent) }
-    }
-    # 2. InstallLocation from Programs and Features
-    $inst = Get-Installed
-    if ($inst -and $inst.InstallLocation -and (Test-Path (Join-Path $inst.InstallLocation "EIDAToolkitService.exe"))) {
-        return $inst.InstallLocation.TrimEnd('\')
-    }
-    # 3. Default folders
-    foreach ($base in ${env:ProgramFiles(x86)}, $env:ProgramFiles, $env:SystemDrive) {
-        if ($base -and (Test-Path (Join-Path $base "$Product\EIDAToolkitService.exe"))) { return (Join-Path $base $Product) }
-    }
-    # 4. Last resort: search Program Files for the service exe
-    foreach ($base in ${env:ProgramFiles(x86)}, $env:ProgramFiles) {
-        if (-not $base) { continue }
-        $hit = Get-ChildItem $base -Filter EIDAToolkitService.exe -Recurse -Depth 2 -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($hit) { return $hit.DirectoryName }
-    }
-    return $null
+function Get-SvcExe($svc) {
+    ($svc.PathName -replace '^"([^"]+)".*$', '$1') -replace '\.exe\s+.*$', '.exe'
 }
-function Get-ToolkitService {
-    Get-CimInstance Win32_Service | Where-Object { $_.PathName -like "*EIDAToolkitService.exe*" } | Select-Object -First 1
+# All toolkit services on the PC (any folder) - used only to PROTECT the ones we must not touch
+function Get-ToolkitServices {
+    Get-CimInstance Win32_Service | Where-Object { $_.PathName -like "*EIDAToolkitService.exe*" -or $_.PathName -like "*ICAToolkit*" }
 }
+function Test-InTarget([string]$path) { $path -and $path.TrimEnd('\').StartsWith($TargetDir, [StringComparison]::OrdinalIgnoreCase) }
+# Only the "Emirates ID Card Toolkit Service": by display name, or running from the target folder
+function Get-EmiratesServices {
+    Get-ToolkitServices | Where-Object { $_.DisplayName -eq $ServiceDisp -or (Test-InTarget (Get-SvcExe $_)) }
+}
+function Get-TargetService {
+    Get-ToolkitServices | Where-Object { Test-InTarget (Get-SvcExe $_) } | Select-Object -First 1
+}
+# Where the registered MSI really lives (path of its EIDAToolkitService.exe component)
+function Get-RegisteredExe($productCode) {
+    try {
+        $wi = New-Object -ComObject WindowsInstaller.Installer
+        $wi.ComponentPath($productCode, "{D34D7FD1-31B2-5F8D-9C4F-64A73D251BD8}")
+    } catch { $null }
+}
+function Test-TargetInstalled { (Test-Path (Join-Path $TargetDir "EIDAToolkitService.exe")) -and (Get-TargetService) }
 
 try {
     $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -70,7 +72,7 @@ try {
     $tag = $rel.tag_name
     $cur = (Get-ItemProperty $RegKey -Name Version -ErrorAction SilentlyContinue).Version
     Write-Output "Latest release: $tag   Installed: $(if ($cur) { $cur } else { 'none' })"
-    if ($cur -eq $tag -and (Get-Installed)) { Write-Output "Already up to date."; return }
+    if ($cur -eq $tag -and (Test-TargetInstalled)) { Write-Output "Already up to date."; return }
 
     $asset = $rel.assets | Where-Object name -eq $AssetName | Select-Object -First 1
     if (-not $asset) { throw "Release $tag has no $AssetName attached." }
@@ -110,64 +112,99 @@ try {
     $pkg = Join-Path $Work "pkg"; Expand-Archive $zip -DestinationPath $pkg -Force
     Write-Output "Package verified and decrypted."
 
-    # 5. Install / reinstall the MSI when needed
+    # 5. Clean reinstall of the "Emirates ID Card Toolkit Service" ONLY.
+    #    Any other toolkit service (e.g. ICAToolkit in C:\Program Files\ICAToolkitService) is NOT touched.
     $msi = Get-ChildItem $pkg -Filter *.msi | Select-Object -First 1
-    $installed = Get-Installed
-    if ($msi) {
-        $msiHash = (Get-FileHash $msi.FullName -Algorithm SHA256).Hash
-        $oldHash = (Get-ItemProperty $RegKey -Name MsiHash -ErrorAction SilentlyContinue).MsiHash
-        if ($installed -and $oldHash -and $oldHash -ne $msiHash) {
-            Write-Output "New MSI in this release - removing old version first"
-            $code = $installed.PSChildName
-            $p = Start-Process msiexec.exe -ArgumentList "/x $code /qn /norestart" -Wait -PassThru
-            if ($p.ExitCode -notin 0, 3010, 1605) { throw "Uninstall failed (exit $($p.ExitCode))." }
-            $installed = $null
-        }
-        if (-not $installed) {
-            Write-Output "Installing $($msi.Name)"
-            $log = "$env:WINDIR\Temp\EID_MOHRE-msi.log"
-            $p = Start-Process msiexec.exe -ArgumentList "/i `"$($msi.FullName)`" /qn /norestart /L*v `"$log`"" -Wait -PassThru
-            if ($p.ExitCode -notin 0, 3010, 1641) { throw "MSI install failed (exit $($p.ExitCode)). See $log" }
-            Start-Sleep -Seconds 5
-        } else { Write-Output "Toolkit already installed - updating config files only." }
-    } elseif (-not $installed) { throw "Toolkit is not installed and this package has no MSI." }
+    if (-not $msi) { throw "This package has no MSI - cannot do a clean install." }
+    $msiHash = (Get-FileHash $msi.FullName -Algorithm SHA256).Hash
+    Write-Output "Target folder: $TargetDir"
 
-    # 6. Copy config files + restart the service
-    $dir = Get-InstallDir
-    if (-not $dir -and $msi) {
-        # Registered as installed, but the program files are missing -> reinstall cleanly
-        Write-Output "Toolkit files not found - reinstalling the MSI"
-        $inst = Get-Installed
-        if ($inst) { Start-Process msiexec.exe -ArgumentList "/x $($inst.PSChildName) /qn /norestart" -Wait | Out-Null }
-        $log = "$env:WINDIR\Temp\EID_MOHRE-msi.log"
-        $p = Start-Process msiexec.exe -ArgumentList "/i `"$($msi.FullName)`" /qn /norestart /L*v `"$log`"" -Wait -PassThru
-        if ($p.ExitCode -notin 0, 3010, 1641) { throw "MSI reinstall failed (exit $($p.ExitCode)). See $log" }
-        Start-Sleep -Seconds 5
-        $dir = Get-InstallDir
+    # Remember the OTHER toolkit services exactly as they are, so they can be restored if anything removes them
+    $protect = @(Get-ToolkitServices | Where-Object { -not (Test-InTarget (Get-SvcExe $_)) -and $_.DisplayName -ne $ServiceDisp } |
+                 Select-Object Name, DisplayName, PathName, StartMode, State)
+    foreach ($o in $protect) { Write-Output "Leaving untouched: '$($o.DisplayName)' ($($o.Name)) -> $($o.PathName)" }
+
+    # Is the registered MSI installed somewhere else (i.e. it IS one of the protected installs)?
+    $inst = Get-Installed
+    if ($inst) {
+        $regExe = Get-RegisteredExe $inst.PSChildName
+        if ($regExe -and -not (Test-InTarget $regExe)) {
+            throw "The MSI is registered for $(Split-Path $regExe -Parent), not $TargetDir. Uninstalling it would remove that install, so nothing was changed. Remove it manually first if you want it replaced."
+        }
     }
-    if (-not $dir) { throw "Toolkit install folder not found. Run: Get-CimInstance Win32_Service | ? PathName -like '*EIDA*' | select Name,PathName" }
-    Write-Output "Install folder: $dir"
+
+    $emirates = @(Get-EmiratesServices)
+    if ($emirates -or (Test-Path $TargetDir) -or $inst) {
+        Write-Output "Existing 'Emirates ID Card Toolkit Service' found - removing it for a clean install"
+
+        # 5a. Back up its config files to C:\ProgramData\EID_MOHRE\backup_<date>
+        $old = Get-ChildItem $TargetDir -Filter "config_*" -File -ErrorAction SilentlyContinue
+        if ($old) {
+            $bak = Join-Path $env:ProgramData ("EID_MOHRE\backup_" + (Get-Date -Format "yyyyMMdd_HHmmss"))
+            New-Item -ItemType Directory $bak -Force | Out-Null; $old | Copy-Item -Destination $bak -Force
+            Write-Output "Old config files backed up to $bak"
+        }
+        # 5b. Stop + delete only the Emirates service(s)
+        foreach ($s in $emirates) {
+            Write-Output "Removing service '$($s.DisplayName)' ($($s.Name))"
+            Stop-Service -Name $s.Name -Force -ErrorAction SilentlyContinue
+            & sc.exe delete "$($s.Name)" | Out-Null
+        }
+        Get-Process EIDAToolkitService -ErrorAction SilentlyContinue | Where-Object { Test-InTarget $_.Path } | Stop-Process -Force
+        Start-Sleep -Seconds 2
+        # 5c. Uninstall the MSI (it belongs to the target folder - checked above)
+        if ($inst) {
+            Write-Output "Uninstalling previous MSI ($($inst.PSChildName))"
+            $p = Start-Process msiexec.exe -ArgumentList "/x $($inst.PSChildName) /qn /norestart" -Wait -PassThru
+            if ($p.ExitCode -notin 0, 3010, 1605) { Write-Warning "MSI uninstall returned $($p.ExitCode) - continuing" }
+            Start-Sleep -Seconds 3
+        }
+        # 5d. Delete the target folder only
+        if (Test-Path $TargetDir) { Write-Output "Deleting $TargetDir"; Remove-Item $TargetDir -Recurse -Force -ErrorAction SilentlyContinue }
+    } else { Write-Output "No existing 'Emirates ID Card Toolkit Service' - fresh install" }
+
+    # 5e. Fresh install into the target folder
+    Write-Output "Installing $($msi.Name) to $TargetDir"
+    $log = "$env:WINDIR\Temp\EID_MOHRE-msi.log"
+    $p = Start-Process msiexec.exe -ArgumentList "/i `"$($msi.FullName)`" INSTALLDIR=`"$TargetDir\`" /qn /norestart /L*v `"$log`"" -Wait -PassThru
+    if ($p.ExitCode -notin 0, 3010, 1641) { throw "MSI install failed (exit $($p.ExitCode)). See $log" }
+    Start-Sleep -Seconds 5
+    if (-not (Test-Path (Join-Path $TargetDir "EIDAToolkitService.exe"))) { throw "MSI finished but EIDAToolkitService.exe is not in $TargetDir. See $log" }
+
+    # 5f. Safety net: put back any protected service that disappeared
+    foreach ($o in $protect) {
+        if (-not (Get-Service -Name $o.Name -ErrorAction SilentlyContinue)) {
+            Write-Warning "Service '$($o.Name)' was removed by the installer - restoring it"
+            $start = if ($o.StartMode -eq "Auto") { "auto" } elseif ($o.StartMode -eq "Disabled") { "disabled" } else { "demand" }
+            & sc.exe create "$($o.Name)" binPath= "$($o.PathName)" DisplayName= "$($o.DisplayName)" start= $start | Out-Null
+            if ($o.State -eq "Running") { Start-Service -Name $o.Name -ErrorAction SilentlyContinue }
+        }
+    }
+
+    # 6. Copy the new config files into the target folder
     $cfg = Get-ChildItem $pkg -File | Where-Object { $_.Extension -ne ".msi" }
-    $svc = Get-ToolkitService
+    $svc = Get-TargetService
     if ($svc -and $svc.State -eq "Running") { Stop-Service -Name $svc.Name -Force; Start-Sleep -Seconds 2 }
-    if ($cfg) {
-        $bak = Join-Path $dir ("_backup_" + (Get-Date -Format "yyyyMMdd_HHmmss"))
-        New-Item -ItemType Directory $bak -Force | Out-Null
-        foreach ($f in $cfg) {
-            $target = Join-Path $dir $f.Name
-            if (Test-Path $target) { Copy-Item $target $bak -Force }
-            Copy-Item $f.FullName $target -Force
-            Write-Output "Updated $($f.Name)"
-        }
+    foreach ($f in $cfg) {
+        Copy-Item $f.FullName (Join-Path $TargetDir $f.Name) -Force
+        Write-Output "Installed $($f.Name)"
     }
-    $svc = Get-ToolkitService
-    if ($svc) {
-        Set-Service -Name $svc.Name -StartupType Automatic
-        Start-Service -Name $svc.Name
-        Write-Output "Service '$($svc.Name)' running."
-    } else { Write-Warning "Toolkit service not found - check the installation." }
 
-    # 7. Remember what is installed
+    # 7. Service: make sure it exists, set its display name, start it
+    $svc = Get-TargetService
+    if (-not $svc) {
+        Write-Output "Registering the toolkit service"
+        Start-Process (Join-Path $TargetDir "EIDAToolkitService.exe") -ArgumentList "-install" -WorkingDirectory $TargetDir -Wait -WindowStyle Hidden
+        Start-Sleep -Seconds 3
+        $svc = Get-TargetService
+    }
+    if (-not $svc) { throw "Toolkit service was not created. Check $TargetDir" }
+    & sc.exe config "$($svc.Name)" DisplayName= "$ServiceDisp" start= auto | Out-Null
+    & sc.exe description "$($svc.Name)" "$ServiceDisp" | Out-Null
+    Start-Service -Name $svc.Name
+    Write-Output "Service '$ServiceDisp' (name: $($svc.Name)) running from $TargetDir"
+
+    # 8. Remember what is installed
     New-Item $RegKey -Force | Out-Null
     Set-ItemProperty $RegKey -Name Version -Value $tag
     if ($msi) { Set-ItemProperty $RegKey -Name MsiHash -Value $msiHash }

@@ -113,6 +113,60 @@ function Invoke-CleanUninstall([string]$productCode) {
     if ($p.ExitCode -notin 0, 3010, 1605) { throw "Uninstall of the old version failed (exit $($p.ExitCode)). See $ulog" }
     Write-Output "Old version uninstalled"
 }
+# Windows Installer stores product codes "squished" in the registry
+function ConvertTo-Squished([string]$guid) {
+    $g = $guid.Trim('{}').Replace('-', '')
+    $rev = { param($t) -join ($t.ToCharArray()[($t.Length - 1)..0]) }
+    $out = (& $rev $g.Substring(0, 8)) + (& $rev $g.Substring(8, 4)) + (& $rev $g.Substring(12, 4))
+    for ($i = 16; $i -lt 32; $i += 2) { $out += "$($g[$i + 1])$($g[$i])" }
+    $out.ToUpper()
+}
+$ProductCode = "{E73E6470-DC25-4CCE-B26C-0730283B0D32}"
+$UpgradeCode = "{511AC963-BA5A-4875-9058-E5E27600023E}"
+function Test-ProductRegistered {
+    $sq = ConvertTo-Squished $ProductCode
+    (Test-Path "HKLM:\SOFTWARE\Classes\Installer\Products\$sq") -or (Test-Path "HKCU:\Software\Microsoft\Installer\Products\$sq") -or
+    [bool](Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData" -ErrorAction SilentlyContinue |
+           Where-Object { Test-Path (Join-Path $_.PSPath "Products\$sq") })
+}
+# Remove every leftover Windows Installer registration of the old toolkit (what Microsoft's
+# "Program Install and Uninstall" troubleshooter does). Keys are exported to C:\ProgramData\EID_MOHRE first.
+function Remove-ProductRegistration {
+    $sq  = ConvertTo-Squished $ProductCode
+    $usq = ConvertTo-Squished $UpgradeCode
+    $bk  = Join-Path $env:ProgramData ("EID_MOHRE\registry_" + (Get-Date -Format "yyyyMMdd_HHmmss"))
+    New-Item -ItemType Directory $bk -Force | Out-Null
+    $keys = @(
+        "HKLM:\SOFTWARE\Classes\Installer\Products\$sq",
+        "HKLM:\SOFTWARE\Classes\Installer\Features\$sq",
+        "HKCU:\Software\Microsoft\Installer\Products\$sq",
+        "HKCU:\Software\Microsoft\Installer\Features\$sq",
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$ProductCode",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$ProductCode"
+    )
+    $ud = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData"
+    foreach ($sid in Get-ChildItem $ud -ErrorAction SilentlyContinue) { $keys += Join-Path $sid.PSPath "Products\$sq" }
+    $n = 0
+    foreach ($k in $keys) {
+        if (Test-Path $k) {
+            $reg = (Convert-Path $k) -replace '^HKEY_LOCAL_MACHINE', 'HKLM' -replace '^HKEY_CURRENT_USER', 'HKCU'
+            & reg.exe export "$reg" (Join-Path $bk ("key$n.reg")) /y | Out-Null
+            Remove-Item $k -Recurse -Force; $n++
+        }
+    }
+    foreach ($uc in "HKLM:\SOFTWARE\Classes\Installer\UpgradeCodes\$usq", "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UpgradeCodes\$usq",
+                    "HKCU:\Software\Microsoft\Installer\UpgradeCodes\$usq") {
+        if (Test-Path $uc) { Remove-ItemProperty $uc -Name $sq -ErrorAction SilentlyContinue }
+    }
+    # Component references to this product (one value per file); harmless if left, but clean them too
+    foreach ($sid in Get-ChildItem $ud -ErrorAction SilentlyContinue) {
+        $c = Join-Path $sid.PSPath "Components"
+        Get-ChildItem $c -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($_.GetValue($sq, $null) -ne $null) { Remove-ItemProperty $_.PSPath -Name $sq -ErrorAction SilentlyContinue }
+        }
+    }
+    Write-Output "Removed $n leftover installer registration key(s) (backup: $bk)"
+}
 function Test-TargetInstalled { (Test-Path (Join-Path $TargetDir "EIDAToolkitService.exe")) -and (Get-TargetService) }
 
 try {
@@ -187,7 +241,7 @@ try {
     }
 
     $emirates = @(Get-EmiratesServices)
-    if ($emirates -or (Test-Path $TargetDir) -or $inst) {
+    if ($emirates -or (Test-Path $TargetDir) -or $inst -or (Test-ProductRegistered)) {
         Write-Output "Existing 'Emirates ID Card Toolkit Service' found - removing it for a clean install"
 
         # 5a. Back up its config files to C:\ProgramData\EID_MOHRE\backup_<date>
@@ -207,6 +261,8 @@ try {
         Start-Sleep -Seconds 2
         # 5c. Uninstall the old MSI (with MOHRE's broken uninstall steps switched off)
         if ($inst) { Invoke-CleanUninstall $inst.PSChildName; Start-Sleep -Seconds 3 }
+        # 5c2. If Windows still has the old product registered anywhere, clear it so the fresh install can run
+        if ((Test-ProductRegistered) -or (Get-Installed)) { Write-Output "Old registration still present - cleaning it"; Remove-ProductRegistration }
         # 5d. Delete the target folder only
         if (Test-Path $TargetDir) { Write-Output "Deleting $TargetDir"; Remove-Item $TargetDir -Recurse -Force -ErrorAction SilentlyContinue }
     } else { Write-Output "No existing 'Emirates ID Card Toolkit Service' - fresh install" }

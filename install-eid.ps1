@@ -1,4 +1,4 @@
-<#
+<# Folder of the installed service
   Install / update the Emirates ID Card Toolkit Service from GitHub (encrypted package).
 
   Manual install (admin PowerShell) - asks for the package password:

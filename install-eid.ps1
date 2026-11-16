@@ -11,7 +11,9 @@
     removes that service + C:\Program Files (x86)\Emirates ID Card Toolkit Service (configs backed up
     to C:\ProgramData\EID_MOHRE), then installs the MSI there again.
     Other toolkit services (e.g. ICAToolkit) are never touched.
-  - Copies the new config_* files in and starts the service as 'Emirates ID Card Toolkit Service'.
+  - Copies every other file in the package (config_* and any extra files, subfolders included) into
+    that folder. Items listed in the package's copy-map.txt ("item = destination folder") are copied
+    to that destination instead. Then starts the service as 'Emirates ID Card Toolkit Service'.
   - Log: C:\Windows\Temp\EID_MOHRE-deploy.log
 #>
 param(
@@ -285,13 +287,55 @@ try {
         }
     }
 
-    # 6. Copy the new config files into the target folder
-    $cfg = Get-ChildItem $pkg -File | Where-Object { $_.Extension -ne ".msi" }
+    # 6. Copy the extra files (everything in the package except the MSI)
+    #    - Default: into the target folder, subfolders kept exactly as they are in the package.
+    #    - Items listed in copy-map.txt go somewhere else instead. One line per item:
+    #          item = destination folder        e.g.   certs = %ProgramData%\MyApp\certs
+    #      "item" is a file or folder in the package; %VARIABLES% are allowed in the destination.
+    $pkgRoot = (Get-Item $pkg).FullName.TrimEnd('\')
+    $mapFile = Join-Path $pkgRoot "copy-map.txt"
+    $jobs = @()
+    if (Test-Path $mapFile) {
+        foreach ($line in Get-Content $mapFile) {
+            $line = $line.Trim()
+            if (-not $line -or $line.StartsWith("#")) { continue }
+            $i = $line.IndexOf("=")
+            if ($i -lt 1) { throw "copy-map.txt: bad line '$line' (expected: item = destination folder)" }
+            $rel  = $line.Substring(0, $i).Trim().Trim('"').Trim('\', '/')
+            $dest = [Environment]::ExpandEnvironmentVariables($line.Substring($i + 1).Trim().Trim('"'))
+            $src  = [IO.Path]::GetFullPath((Join-Path $pkgRoot $rel))
+            if (-not $rel -or -not $src.StartsWith($pkgRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { throw "copy-map.txt: '$rel' is not inside the package" }
+            if (-not (Test-Path $src)) { throw "copy-map.txt: '$rel' was not found in the package" }
+            if (-not $dest -or $dest.Contains('%') -or -not [IO.Path]::IsPathRooted($dest)) { throw "copy-map.txt: destination for '$rel' must be a full path (got '$dest')" }
+            $jobs += [pscustomobject]@{ Src = $src; Dest = $dest }
+        }
+    }
     $svc = Get-TargetService
     if ($svc -and $svc.State -eq "Running") { Stop-Service -Name $svc.Name -Force; Start-Sleep -Seconds 2 }
-    foreach ($f in $cfg) {
-        Copy-Item $f.FullName (Join-Path $TargetDir $f.Name) -Force
-        Write-Output "Installed $($f.Name)"
+    $copyOne = {
+        param([string]$from, [string]$to)
+        New-Item -ItemType Directory (Split-Path $to -Parent) -Force | Out-Null
+        Copy-Item -LiteralPath $from -Destination $to -Force
+        Write-Output "Installed $to"
+    }
+    # 6a. Everything not listed in copy-map.txt -> target folder
+    foreach ($f in Get-ChildItem $pkgRoot -File -Recurse) {
+        if ($f.FullName -eq $mapFile) { continue }
+        if ($f.DirectoryName -eq $pkgRoot -and $f.Extension -eq ".msi") { continue }
+        $isMapped = $false
+        foreach ($j in $jobs) {
+            if ($f.FullName -eq $j.Src -or $f.FullName.StartsWith($j.Src + '\', [StringComparison]::OrdinalIgnoreCase)) { $isMapped = $true; break }
+        }
+        if ($isMapped) { continue }
+        & $copyOne $f.FullName (Join-Path $TargetDir $f.FullName.Substring($pkgRoot.Length + 1))
+    }
+    # 6b. Items listed in copy-map.txt -> their own destination
+    foreach ($j in $jobs) {
+        if (Test-Path $j.Src -PathType Container) {
+            foreach ($f in Get-ChildItem $j.Src -File -Recurse) { & $copyOne $f.FullName (Join-Path $j.Dest $f.FullName.Substring($j.Src.Length + 1)) }
+        } else {
+            & $copyOne $j.Src (Join-Path $j.Dest (Split-Path $j.Src -Leaf))
+        }
     }
 
     # 7. Service: make sure it exists, set its display name, start it
